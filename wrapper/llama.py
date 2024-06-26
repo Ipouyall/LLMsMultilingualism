@@ -1,46 +1,7 @@
 import torch
-from torch import nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import transformers
-from safetensors.torch import load_file
 from collections import defaultdict
-
-
-def load_tokenizer_only(model_size, hf_token=None):
-    tokenizer = AutoTokenizer.from_pretrained(f'/dlabdata1/llama2_hf/Llama-2-{model_size}-hf', use_auth_token=hf_token)
-    return tokenizer
-
-
-def load_unemb_only(model_size):
-    if model_size == '70B' or model_size == '70b':
-        lm_head_state_dict = load_file("/dlabdata1/llama2_hf/Llama-2-70b-hf/model-00015-of-00015.safetensors")
-        norm_state_dict = load_file("/dlabdata1/llama2_hf/Llama-2-70b-hf/model-00014-of-00015.safetensors")
-    if model_size == '7B' or model_size == '7b':
-        lm_head_state_dict = load_file('/dlabdata1/llama2_hf/Llama-2-7b-hf/model-00002-of-00002.safetensors')
-        norm_state_dict = lm_head_state_dict
-    if model_size == '13B' or model_size == '13b':
-        lm_head_state_dict = load_file("/dlabdata1/llama2_hf/Llama-2-13b-hf/model-00003-of-00003.safetensors")
-        norm_state_dict = lm_head_state_dict
-
-    norm_params = norm_state_dict['model.norm.weight'].detach().clone()
-    lm_head_params = lm_head_state_dict['lm_head.weight'].detach().clone()
-
-    lm_head = nn.Linear(*lm_head_params.shape[::-1], bias=False)
-    lm_head.weight.requires_grad_(False)
-    lm_head.weight.copy_(lm_head_params)
-    norm = transformers.models.llama.modeling_llama.LlamaRMSNorm(len(norm_params))
-    norm.weight.requires_grad_(False)
-    norm.weight.copy_(norm_params)
-    unemb = nn.Sequential(norm, lm_head)
-    if torch.cuda.device_count() >= 2:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        # Wrap your model with DataParallel
-        unemb = nn.DataParallel(unemb, device_ids=[0, 1])
-        # Move your model to the first device
-        unemb = unemb.cuda()
-    else:
-        unemb.cuda()
-    return unemb
+from transformers import BitsAndBytesConfig
 
 
 class AttnWrapper(torch.nn.Module):
@@ -157,17 +118,20 @@ class BlockOutputWrapper(torch.nn.Module):
         return self.block.self_attn.activations
 
 
-class Llama2Helper:
-    def __init__(self, dir='/dlabdata1/llama2_hf/Llama-2-7b-hf', hf_token=None, device=None, load_in_8bit=True,
-                 use_embed_head=False, device_map='auto'):
+class LlamaHelper:
+    def __init__(self, dir='/dlabdata1/llama2_hf/Llama-2-7b-hf', hf_token=None, device=None, load_in_8bit=True, use_embed_head=False):
+        quantization_config = BitsAndBytesConfig(load_in_8bit=load_in_8bit)
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(dir, use_auth_token=hf_token)
-        self.model = AutoModelForCausalLM.from_pretrained(dir, use_auth_token=hf_token,
-                                                          device_map=device_map,
-                                                          load_in_8bit=load_in_8bit)
+        self.tokenizer = AutoTokenizer.from_pretrained(dir, token=hf_token)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            dir,
+            token=hf_token,
+            device_map='auto',
+            quantization_config=quantization_config
+        )
         self.use_embed_head = True
         W = list(self.model.model.embed_tokens.parameters())[0].detach()
         self.head_embed = torch.nn.Linear(W.size(1), W.size(0), bias=False)
@@ -177,7 +141,7 @@ class Llama2Helper:
             self.head_embed.weight.copy_(W)
         self.head_embed.to(self.model.device)
         self.head_unembed = self.model.lm_head
-        # self.model = self.model.to(self.device)
+        #self.model = self.model.to(self.device)
         self.device = next(self.model.parameters()).device
         if use_embed_head:
             head = self.head_embed
@@ -185,6 +149,7 @@ class Llama2Helper:
             head = self.head_unembed
         for i, layer in enumerate(self.model.model.layers):
             self.model.model.layers[i] = BlockOutputWrapper(layer, head, self.model.model.norm)
+
 
     def set_embed_head(self):
         self.use_embed_head = True
@@ -199,16 +164,16 @@ class Llama2Helper:
     def generate_text(self, prompt, max_length=100):
         inputs = self.tokenizer(prompt, return_tensors="pt")
         generate_ids = self.model.generate(inputs.input_ids.to(self.device), max_length=max_length)
-        return self.tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[
-            0]
+        return self.tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
 
     def generate_intermediate_text(self, layer_idx, prompt, max_length=100, temperature=1.0):
         layer = self.model.model.layers[layer_idx]
         for _ in range(max_length):
             self.get_logits(prompt)
-            next_id = self.sample_next_token(layer.block_output_unembedded[:, -1], temperature=temperature)
-            # next_token = self.tokenizer.decode(next_id)
-            prompt = self.tokenizer.decode(self.tokenizer.encode(prompt)[1:] + [next_id])
+            next_id = self.sample_next_token(layer.block_output_unembedded[:,-1], temperature=temperature)
+            #next_token = self.tokenizer.decode(next_id)
+            prompt = self.tokenizer.decode(self.tokenizer.encode(prompt)[1:]+[next_id])
             if next_id == self.tokenizer.eos_token_id:
                 break
         return prompt
@@ -217,7 +182,7 @@ class Llama2Helper:
         assert temperature >= 0, "temp must be geq 0"
         if temperature == 0:
             return self._sample_greedy(logits)
-        return self._sample_basic(logits / temperature)
+        return self._sample_basic(logits/temperature)
 
     def _sample_greedy(self, logits):
         return logits.argmax().item()
@@ -228,8 +193,8 @@ class Llama2Helper:
     def get_logits(self, prompt):
         inputs = self.tokenizer(prompt, return_tensors="pt")
         with torch.no_grad():
-            logits = self.model(inputs.input_ids).logits
-            return logits
+          logits = self.model(inputs.input_ids).logits
+          return logits
 
     def set_neuron_intervention(self, layer_idx, neuron_idx, mean):
         self.model.model.layers[layer_idx].mlp_freeze_neuron(neuron_idx, mean)
@@ -241,8 +206,8 @@ class Llama2Helper:
         return self.model.model.layers[layer].get_attn_activations()
 
     def set_add_to_last_tensor(self, layer, tensor):
-        print('setting up intervention: add tensor to last soft token')
-        self.model.model.layers[layer].block_add_to_last_tensor(tensor)
+      print('setting up intervention: add tensor to last soft token')
+      self.model.model.layers[layer].block_add_to_last_tensor(tensor)
 
     def reset_all(self):
         for layer in self.model.model.layers:
@@ -255,8 +220,7 @@ class Llama2Helper:
         tokens = self.tokenizer.batch_decode(indices.unsqueeze(-1))
         print(label, list(zip(indices.detach().cpu().numpy().tolist(), tokens, probs_percent)))
 
-    def logits_all_layers(self, text, return_attn_mech=False, return_intermediate_res=False, return_mlp=False,
-                          return_block=True):
+    def logits_all_layers(self, text, return_attn_mech=False, return_intermediate_res=False, return_mlp=False, return_block=True):
         res = defaultdict(list)
         self.get_logits(text)
         for i, layer in enumerate(self.model.model.layers):
@@ -268,14 +232,13 @@ class Llama2Helper:
                 res['block_1'] += [layer.intermediate_res_unembedded.detach().cpu()]
             if return_mlp:
                 res['mlp'] += [layer.mlp_output_unembedded.detach().cpu()]
-        for k, v in res.items():
+        for k,v in res.items():
             res[k] = torch.cat(v, dim=0)
         if len(res) == 1:
             return list(res.values())[0]
         return res
 
-    def latents_all_layers(self, text, return_attn_mech=False, return_intermediate_res=False, return_mlp=False,
-                           return_mlp_post_activation=False, return_block=True):
+    def latents_all_layers(self, text, return_attn_mech=False, return_intermediate_res=False, return_mlp=False, return_mlp_post_activation=False, return_block=True):
         if return_attn_mech or return_intermediate_res or return_mlp:
             raise NotImplemented("not implemented")
         self.get_logits(text)
@@ -288,8 +251,7 @@ class Llama2Helper:
                 tensors += [layer.mlp_post_activation.detach().cpu()]
         return torch.cat(tensors, dim=0)
 
-    def decode_all_layers(self, text, topk=10, print_attn_mech=True, print_intermediate_res=True, print_mlp=True,
-                          print_block=True):
+    def decode_all_layers(self, text, topk=10, print_attn_mech=True, print_intermediate_res=True, print_mlp=True, print_block=True):
         print('Prompt:', text)
         self.get_logits(text)
         for i, layer in enumerate(self.model.model.layers):
